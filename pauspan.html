@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pauspan — Particle Background</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #020209;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+  }
+
+  canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    display: block;
+  }
+
+  /* controls */
+  #controls {
+    position: fixed;
+    bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    display: flex; gap: 24px; flex-wrap: wrap;
+    align-items: center; justify-content: center;
+    z-index: 20;
+  }
+  .ctrl { display: flex; align-items: center; gap: 8px; }
+  .ctrl label {
+    color: rgba(100,160,255,0.5);
+    font-size: 9px; letter-spacing: 0.15em;
+    text-transform: uppercase; font-family: monospace;
+  }
+  .ctrl input[type=range] { width: 90px; accent-color: #48aaff; cursor: pointer; }
+  .ctrl span {
+    color: rgba(100,200,255,0.8);
+    font-size: 10px; font-family: monospace; min-width: 30px;
+  }
+
+  #hint {
+    position: fixed; top: 20px; right: 20px;
+    color: rgba(100,160,255,0.35); font-size: 9px;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    font-family: monospace; z-index: 20;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div id="hint">move mouse to interact</div>
+
+<div id="controls">
+  <div class="ctrl"><label>Speed</label><input type="range" id="speed" min="0.1" max="3" step="0.05" value="0.7"><span id="speedv">0.70</span></div>
+  <div class="ctrl"><label>Scatter</label><input type="range" id="scatter" min="0" max="1" step="0.01" value="0"><span id="scatterv">0.00</span></div>
+  <div class="ctrl"><label>Glow</label><input type="range" id="glow" min="0.3" max="1.5" step="0.05" value="0.85"><span id="glowv">0.85</span></div>
+  <div class="ctrl"><label>Depth</label><input type="range" id="depth" min="0.5" max="3" step="0.05" value="1.2"><span id="depthv">1.20</span></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ══════════════════════════════════════════════════════
+//  PAUSPAN — Particle Text Background
+//  Drop canvas#c into any page as a background layer
+// ══════════════════════════════════════════════════════
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x020209, 1);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 3000);
+camera.position.set(0, 0, 280);
+
+// ── controls ─────────────────────────────────────────
+const ctrls = { speed: 0.7, scatter: 0, glow: 0.85, depth: 1.2 };
+Object.keys(ctrls).forEach(id => {
+  const el = document.getElementById(id);
+  const out = document.getElementById(id + 'v');
+  el.addEventListener('input', () => {
+    ctrls[id] = parseFloat(el.value);
+    out.textContent = ctrls[id].toFixed(2);
+  });
+});
+
+// ── rasterise "PAUSPAN" on a 2D canvas ──────────────
+// Returns points normalised to [-0.5, 0.5] range so we can
+// scale them to any world size at render time.
+function getTextPoints(text) {
+  const TC_W = 1024, TC_H = 256;
+  const tc = document.createElement('canvas');
+  tc.width  = TC_W;
+  tc.height = TC_H;
+  const ctx = tc.getContext('2d');
+
+  // Fit font size so text fills ~90% of canvas width
+  let fontSize = 180;
+  ctx.font = `900 ${fontSize}px Arial Black, Impact, sans-serif`;
+  let measured = ctx.measureText(text).width;
+  fontSize = Math.floor(fontSize * (TC_W * 0.88) / measured);
+  fontSize = Math.min(fontSize, TC_H * 0.82);
+
+  ctx.font = `900 ${fontSize}px Arial Black, Impact, sans-serif`;
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, TC_W / 2, TC_H / 2);
+
+  const data = ctx.getImageData(0, 0, TC_W, TC_H).data;
+  const points = [];
+  const step = 3;
+
+  for (let y = 0; y < TC_H; y += step) {
+    for (let x = 0; x < TC_W; x += step) {
+      if (data[(y * TC_W + x) * 4 + 3] > 128) {
+        points.push({
+          x: (x / TC_W - 0.5),           // normalised -0.5 … +0.5
+          y: -(y / TC_H - 0.5)
+        });
+      }
+    }
+  }
+  return points;
+}
+
+const textPoints = getTextPoints('PAUSPAN');
+
+// Compute how wide the world is at z=0 given camera z and FOV.
+// We use this every frame so it stays correct after resize too.
+function getWorldWidth() {
+  const camZ   = 280;
+  const fovRad = (55 * Math.PI) / 180;
+  const height = 2 * Math.tan(fovRad / 2) * camZ;
+  const width  = height * (window.innerWidth / window.innerHeight);
+  return { w: width, h: height };
+}
+const WORD_COUNT = textPoints.length;
+// getWorldWidth() used each frame for responsive scaling
+
+// ── background ambient particles ─────────────────────
+const AMB_COUNT = 6000;
+const TOTAL = WORD_COUNT + AMB_COUNT;
+
+const geo = new THREE.BufferGeometry();
+const pos   = new Float32Array(TOTAL * 3);
+const col   = new Float32Array(TOTAL * 3);
+const meta  = new Float32Array(TOTAL * 4); // seed, speed offset, phase, type
+
+// initialise
+for (let i = 0; i < TOTAL; i++) {
+  const isText = i < WORD_COUNT;
+
+  // random start position
+  pos[i*3]   = (Math.random() - 0.5) * 400;
+  pos[i*3+1] = (Math.random() - 0.5) * 200;
+  pos[i*3+2] = (Math.random() - 0.5) * 100;
+
+  meta[i*4]   = Math.random() * 100;       // seed
+  meta[i*4+1] = Math.random() * Math.PI * 2; // phase offset
+  meta[i*4+2] = 0.4 + Math.random() * 0.6;  // individual speed
+  meta[i*4+3] = isText ? 1 : 0;             // 1=text particle, 0=ambient
+
+  col[i*3]   = 0.3;
+  col[i*3+1] = 0.6;
+  col[i*3+2] = 1.0;
+}
+
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+geo.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+
+const mat = new THREE.PointsMaterial({
+  size: 1.4,
+  vertexColors: true,
+  sizeAttenuation: true,
+  transparent: true,
+  opacity: 1,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending
+});
+
+scene.add(new THREE.Points(geo, mat));
+
+// ── mouse parallax ────────────────────────────────────
+let mouseX = 0, mouseY = 0;
+window.addEventListener('mousemove', e => {
+  mouseX = (e.clientX / window.innerWidth  - 0.5) * 2;
+  mouseY = (e.clientY / window.innerHeight - 0.5) * 2;
+});
+
+// ── touch support ─────────────────────────────────────
+window.addEventListener('touchmove', e => {
+  mouseX = (e.touches[0].clientX / window.innerWidth  - 0.5) * 2;
+  mouseY = (e.touches[0].clientY / window.innerHeight - 0.5) * 2;
+}, { passive: true });
+
+// ── scroll tilt ───────────────────────────────────────
+let scrollY = 0;
+window.addEventListener('scroll', () => { scrollY = window.scrollY; });
+
+// ── resize ────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ── animation ─────────────────────────────────────────
+const startTime = performance.now() * 0.001;
+const TWO_PI = Math.PI * 2;
+const color = new THREE.Color();
+let targetCamX = 0, targetCamY = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const now   = performance.now() * 0.001;
+  const time  = (now - startTime) * ctrls.speed;
+  const scatter   = ctrls.scatter;
+  const glowMult  = ctrls.glow;
+  const depthAmp  = ctrls.depth;
+
+  // eased camera parallax — stronger mouse influence
+  targetCamX += (mouseX * 55 - targetCamX) * 0.06;
+  targetCamY += (-mouseY * 32 - targetCamY) * 0.06;
+  camera.position.x = targetCamX;
+  camera.position.y = targetCamY + scrollY * -0.02;
+  camera.position.z = 280 + Math.sin(time * 0.12) * 15;
+  camera.lookAt(targetCamX * 0.25, targetCamY * 0.25, 0);
+
+  const posArr = geo.attributes.position.array;
+  const colArr = geo.attributes.color.array;
+
+  // ── text particles ────────────────────────────────
+  // Recompute world dimensions each frame so resize is always correct
+  const ww = getWorldWidth();
+  const textWorldW = ww.w * 0.82;   // 82% of viewport width
+  const textWorldH = ww.h * 0.30;   // 30% of viewport height (aspect-limited)
+
+  for (let i = 0; i < WORD_COUNT; i++) {
+    const tp    = textPoints[i];
+    const seed  = meta[i*4];
+    const phase = meta[i*4+1];
+    const spd   = meta[i*4+2];
+
+    // tp.x / tp.y are in [-0.5, +0.5] — map to world units
+    const tx = tp.x * textWorldW;
+    const ty = tp.y * textWorldH;
+
+    // wave drift — also pushed by mouse position
+    const waveX = Math.sin(time * 0.4 * spd + phase) * 1.8 * (1 - scatter * 0.3) + mouseX * 8;
+    const waveY = Math.cos(time * 0.3 * spd + phase + 1.2) * 1.2 * (1 - scatter * 0.3) + mouseY * 5;
+
+    // scatter: blow apart and reform
+    const scatterX = Math.sin(seed * 3.7 + time * 0.15) * 180 * scatter;
+    const scatterY = Math.cos(seed * 2.1 + time * 0.12) * 90  * scatter;
+    const scatterZ = Math.sin(seed * 5.3 + time * 0.18) * 80  * scatter;
+
+    // depth breathing
+    const dz = Math.sin(time * 0.25 * spd + phase * 2) * 18 * depthAmp;
+
+    posArr[i*3]   = tx + waveX + scatterX;
+    posArr[i*3+1] = ty + waveY + scatterY;
+    posArr[i*3+2] = dz + scatterZ;
+
+    // colour: cool electric blue → cyan → white at peaks
+    const pulse  = Math.sin(time * 1.1 * spd + phase) * 0.5 + 0.5;
+    const hue    = 0.58 + pulse * 0.08 + Math.sin(seed + time * 0.2) * 0.04;
+    const sat    = 0.85 - pulse * 0.3;
+    const lit    = (0.45 + pulse * 0.45) * glowMult;
+
+    color.setHSL(hue, sat, Math.min(lit, 1));
+    colArr[i*3]   = color.r;
+    colArr[i*3+1] = color.g;
+    colArr[i*3+2] = color.b;
+  }
+
+  // ── ambient particles ─────────────────────────────
+  for (let j = 0; j < AMB_COUNT; j++) {
+    const i    = WORD_COUNT + j;
+    const seed  = meta[i*4];
+    const phase = meta[i*4+1];
+    const spd   = meta[i*4+2];
+
+    // drift slowly through space
+    const ax = Math.sin(seed * 2.3 + time * 0.08 * spd) * 200;
+    const ay = Math.cos(seed * 1.7 + time * 0.07 * spd) * 100;
+    const az = Math.sin(seed * 3.1 + time * 0.05 * spd) * 60 - 30;
+
+    posArr[i*3]   = ax;
+    posArr[i*3+1] = ay;
+    posArr[i*3+2] = az;
+
+    // dim, slow-pulse color
+    const energy = Math.sin(time * 0.3 * spd + phase) * 0.5 + 0.5;
+    const hue    = 0.55 + energy * 0.12 + seed * 0.04;
+    const lit    = (0.06 + energy * 0.12) * glowMult;
+
+    color.setHSL(hue % 1, 0.9, Math.min(lit, 1));
+    colArr[i*3]   = color.r;
+    colArr[i*3+1] = color.g;
+    colArr[i*3+2] = color.b;
+  }
+
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.color.needsUpdate    = true;
+
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>
